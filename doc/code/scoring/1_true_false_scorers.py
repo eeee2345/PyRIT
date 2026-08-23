@@ -136,6 +136,16 @@ print(f"[package] real imports only  -> {clean.get_value()}")
 # encoding-based evasion. It favors recall over precision, so use it as a cheap pre-filter ahead of
 # a model-based scorer such as `PromptShieldScorer`.
 #
+# ### AgentThreatRulesScorer
+#
+# `AgentThreatRulesScorer` is a `RegexScorer` subclass that flags text matching an Agent Threat
+# Rules (ATR) detection rule — an MIT-licensed community ruleset for AI-agent threats. It returns
+# True when a rule at or above the configured minimum severity matches, and records the matched
+# rule IDs, ATR category, and maximum severity in score metadata. It takes no dependency on ATR:
+# upstream publishes a precompiled digest of the ruleset as data, fetched from a pinned commit on
+# first use and cached under `DB_DATA_PATH`. Pass `digest_source` with `source_type="file"` to run
+# with no network access, or a raw URL on `main` to track upstream additions.
+#
 # ### DecodingScorer
 #
 # `DecodingScorer` checks whether the request text (its `original_value`, `converted_value`, or

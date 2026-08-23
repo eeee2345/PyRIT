@@ -8,6 +8,9 @@ SSRF, SSTI, XXE, open redirect, and LDAP injection), prompt injection,
 markdown injection, and CBRN/illicit-substance keywords.
 """
 
+from pyrit.score.true_false.regex.agent_threat_rules_scorer import (
+    AgentThreatRulesScorer,
+)
 from pyrit.score.true_false.regex.anthrax_keyword_scorer import AnthraxKeywordScorer
 from pyrit.score.true_false.regex.credential_leak_scorer import CredentialLeakScorer
 from pyrit.score.true_false.regex.fentanyl_keyword_scorer import FentanylKeywordScorer
@@ -31,6 +34,7 @@ from pyrit.score.true_false.regex.xss_output_scorer import XSSOutputScorer
 from pyrit.score.true_false.regex.xxe_output_scorer import XXEOutputScorer
 
 __all__ = [
+    "AgentThreatRulesScorer",
     "AnthraxKeywordScorer",
     "CredentialLeakScorer",
     "FentanylKeywordScorer",
