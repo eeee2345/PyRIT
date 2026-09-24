@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from pyrit.common.path import DB_DATA_PATH
+from pyrit.models import ComponentIdentifier, Message, MessagePiece, Score
+from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 from pyrit.score.true_false.regex.regex_scorer import RegexScorer
+from pyrit.score.true_false.true_false_score_aggregator import TrueFalseAggregatorFunc, TrueFalseScoreAggregator
 
 logger = logging.getLogger(__name__)
 
 # Pinned by default so a PyRIT release scores against a known ruleset. Callers
-# that want to track ATR's main branch pass ref="main" explicitly and accept
+# that want to track ATR's main branch pass ref="main", cache=False and accept
 # that their results move when ATR does.
 DEFAULT_ATR_REF = "54d3e13e94f8980d7b36f9d79511b26174954dfc"
 
@@ -45,11 +48,12 @@ class AgentThreatRulesScorer(RegexScorer):
     The digest is fetched from a pinned commit by default and cached under
     ``DB_DATA_PATH``, the same mechanism the ATR seed dataset already uses.
 
-    ATR rules are written against specific agent surfaces (``content``,
-    ``tool_response``, ``tool_args`` and so on). A scorer sees one piece of
-    text with no surface label, so by default only conditions written against
-    the digest's ``default_fields`` are loaded. Pass ``fields`` to widen or
-    narrow that selection when you know which surface your text came from.
+    ``fields`` selects rules, not evidence. Message roles and data types select
+    the evidence: text supplies ``content`` and its role-specific field,
+    ``function_call`` pieces supply ``tool_name`` and ``tool_args``, and
+    ``function_call_output`` pieces supply ``content`` and ``tool_response``.
+    Loose text is scored as user text. A call match describes a requested call,
+    not proof that a tool executed.
 
     Note that ATR's own precision figures are measured on corpora that ATR
     rules were partly mined from, so they do not transfer to this setting.
@@ -57,6 +61,16 @@ class AgentThreatRulesScorer(RegexScorer):
     """
 
     _DEFAULT_CATEGORIES: tuple[str, ...] = ("agent_threat",)
+    _SUPPORTED_FIELDS = frozenset({"content", "agent_output", "user_input", "tool_name", "tool_args", "tool_response"})
+    _DEFAULT_VALIDATOR = ScorerPromptValidator(
+        supported_data_types=["text", "function_call", "function_call_output"],
+    )
+    _ROLE_FIELDS: dict[str, str] = {
+        "assistant": "agent_output",
+        "simulated_assistant": "agent_output",
+        "user": "user_input",
+        "tool": "tool_response",
+    }
 
     def __init__(
         self,
@@ -65,17 +79,18 @@ class AgentThreatRulesScorer(RegexScorer):
         fields: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
         cache: bool = True,
-        validator: Any = None,
-        score_aggregator: Any = None,
+        validator: ScorerPromptValidator | None = None,
+        score_aggregator: TrueFalseAggregatorFunc = TrueFalseScoreAggregator.OR,
     ) -> None:
         """
         Args:
             ref: ATR git ref to load the digest from. Defaults to a pinned
-                commit; pass ``"main"`` to track ATR's default branch.
+                commit; pass ``"main", cache=False`` to track ATR's default branch.
             fields: ATR detection fields to load conditions for. Defaults to
                 the digest's own ``default_fields``.
             categories: Score categories. Defaults to ``("agent_threat",)``.
-            cache: Whether to cache the fetched digest under ``DB_DATA_PATH``.
+            cache: Whether to cache the digest indefinitely under ``DB_DATA_PATH``.
+                Disable this for a fresh download from a mutable ref.
             validator: Passed through to ``RegexScorer``.
             score_aggregator: Passed through to ``RegexScorer``.
 
@@ -84,26 +99,44 @@ class AgentThreatRulesScorer(RegexScorer):
                 schema, or yields no patterns for the requested fields.
         """
         digest = _load_digest(ref=ref, cache=cache)
-        patterns = _patterns_from_digest(digest, fields=fields)
+        selected_fields = fields if fields is not None else digest.get("default_fields")
+        if (
+            not isinstance(selected_fields, Sequence)
+            or isinstance(selected_fields, str)
+            or not all(isinstance(field, str) for field in selected_fields)
+        ):
+            raise ValueError("fields must be a sequence of field names, not a string")
+        unsupported = set(selected_fields) - self._SUPPORTED_FIELDS
+        if unsupported:
+            raise ValueError(f"No message extraction is available for ATR fields: {sorted(unsupported)}")
+        patterns = _patterns_from_digest(digest, fields=selected_fields)
 
-        if not patterns:
-            requested = list(fields) if fields is not None else digest.get("default_fields")
+        present = {condition["field"] for condition in digest["conditions"].values()}
+        missing = set(selected_fields) - present
+        if missing:
             raise ValueError(
-                f"ATR digest at ref {ref!r} yielded no patterns for fields {requested!r}. "
-                f"Fields present in this digest: {sorted(digest.get('conditions_by_field', {}))}"
+                f"ATR digest at ref {ref!r} yielded no patterns for fields {sorted(missing)!r}. "
+                f"Fields present in this digest: {sorted(present)}"
             )
 
-        self._atr_ref = ref
-        self._atr_version = str(digest.get("atr_version", "unknown"))
-        self._atr_commit = str(digest.get("atr_commit", ref))
-        self._atr_fields = tuple(fields) if fields is not None else tuple(digest.get("default_fields", ()))
-        self._atr_rule_count = len({v["rule_id"] for v in digest["conditions"].values() if "rule_id" in v})
+        self._atr_fields = tuple(sorted(set(selected_fields)))
+        self._digest_hash = hashlib.sha256(
+            json.dumps(digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self._provenance: dict[str, str | int | float] = {
+            "atr_ref": ref,
+            "atr_digest_url": _DIGEST_URL_TEMPLATE.format(ref=ref),
+            "atr_digest_sha256": self._digest_hash,
+        }
+        for key in ("atr_commit", "atr_version"):
+            if isinstance(digest.get(key), str):
+                self._provenance[key] = digest[key]
 
         logger.info(
             "AgentThreatRulesScorer loaded %d patterns from ATR %s (%s), fields=%s",
             len(patterns),
-            self._atr_version,
-            self._atr_commit[:8],
+            digest.get("atr_version", "unknown"),
+            str(digest.get("atr_commit", ref))[:8],
             ",".join(self._atr_fields),
         )
 
@@ -113,6 +146,115 @@ class AgentThreatRulesScorer(RegexScorer):
             validator=validator,
             score_aggregator=score_aggregator,
         )
+        self._patterns_by_field = {
+            field: {name: self._compiled[name] for name in patterns if digest["conditions"][name]["field"] == field}
+            for field in self._atr_fields
+        }
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        return self._create_identifier(
+            params={
+                "digest_sha256": self._digest_hash,
+                "fields": list(self._atr_fields),
+                "categories": self._score_categories,
+            },
+            score_aggregator=self._score_aggregator.__name__,  # type: ignore[ty:unresolved-attribute]
+        )
+
+    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
+        values = self._extract_fields(message_piece)
+        fields = self._patterns_by_field.keys() & values.keys()
+        if not fields:
+            return []
+        texts: dict[str, list[str]] = {}
+        for field in fields:
+            text = values[field]
+            if text is None:
+                continue
+            texts[field] = [text]
+            if field == "tool_args" and (arguments := _json_object(text)) is not None:
+                normalized = _field_text(arguments)
+                if normalized != text:
+                    texts[field].append(normalized)
+        matched = sorted(
+            name
+            for field, candidates in texts.items()
+            for name, pattern in self._patterns_by_field[field].items()
+            if any(pattern.search(text) for text in candidates)
+        )
+        unreadable = sorted(field for field in fields if values[field] is None)
+        if not matched and unreadable:
+            score = self._build_undetermined_score(
+                rationale=f"Could not read ATR fields: {', '.join(unreadable)}.",
+                message_piece_id=message_piece.id,
+                objective=objective,
+                score_category=self._score_categories,
+            )
+        else:
+            score = self._build_match_score(
+                message_piece=message_piece,
+                matched=matched,
+                objective=objective,
+                description="True if an ATR pattern matched its message field; not proof of tool execution.",
+            )
+        return self._with_provenance([score])
+
+    def _build_fallback_score(self, *, message: Message, objective: str | None) -> list[Score]:
+        return self._with_provenance(super()._build_fallback_score(message=message, objective=objective))
+
+    def _with_provenance(self, scores: list[Score]) -> list[Score]:
+        for score in scores:
+            score.score_metadata = {**(score.score_metadata or {}), **self._provenance}
+        return scores
+
+    @classmethod
+    def _extract_fields(cls, piece: MessagePiece) -> dict[str, str | None]:
+        data_type = piece.converted_value_data_type
+        if data_type == "text":
+            values: dict[str, str | None] = {"content": piece.converted_value}
+            if role_field := cls._ROLE_FIELDS.get(piece.role):
+                values[role_field] = piece.converted_value
+            return values
+        if data_type == "function_call_output" and piece.role == "tool":
+            payload = _json_object(piece.converted_value)
+            output = _field_text(payload["output"]) if payload is not None and "output" in payload else None
+            return {"content": output, "tool_response": output}
+        if data_type != "function_call" or piece.role != "assistant":
+            return {}
+        payload = _json_object(piece.converted_value)
+        # Chat Completions nests the call under "function"; Responses keeps it flat.
+        if payload is not None and payload.get("type") == "function":
+            payload = payload.get("function")
+        if not isinstance(payload, dict):
+            return {"tool_name": None, "tool_args": None}
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        return {
+            "tool_name": name if isinstance(name, str) and name.strip() else None,
+            "tool_args": _field_text(arguments) if isinstance(arguments, (str, dict)) else None,
+        }
+
+
+def _json_object(value: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _field_text(value: Any) -> str:
+    """
+    Keep strings intact; encode structured values as compact, stable JSON.
+
+    Returns:
+        str: The field's text representation.
+    """
+    return (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 def _patterns_from_digest(
@@ -175,7 +317,7 @@ def _load_digest(*, ref: str, cache: bool) -> dict[str, Any]:
             digest = json.loads(cache_file.read_text(encoding="utf-8"))
             _validate_digest(digest, source=str(cache_file))
             return digest
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             # A corrupt cache entry must not be fatal, but it must be visible:
             # silently refetching hides a disk problem that will recur.
             logger.warning("Discarding unreadable ATR digest cache %s: %s", cache_file, exc)
@@ -184,7 +326,7 @@ def _load_digest(*, ref: str, cache: bool) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 - fixed https host
             raw = response.read().decode("utf-8")
-    except Exception as exc:
+    except (OSError, UnicodeError) as exc:
         raise ValueError(f"Could not fetch the ATR digest from {url}: {exc}") from exc
 
     try:
@@ -237,8 +379,10 @@ def _validate_digest(digest: Any, *, source: str) -> None:
 
     for name, condition in conditions.items():
         pattern = condition.get("pattern") if isinstance(condition, dict) else None
-        if not pattern:
+        if not isinstance(pattern, str) or not pattern:
             raise ValueError(f"ATR digest condition {name!r} has no pattern")
+        if not isinstance(condition.get("field"), str) or not condition["field"]:
+            raise ValueError(f"ATR digest condition {name!r} has no field")
         try:
             re.compile(pattern)
         except re.error as exc:
