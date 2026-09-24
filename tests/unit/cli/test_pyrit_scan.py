@@ -7,6 +7,7 @@ Unit tests for the pyrit_scan CLI module (thin REST client).
 
 import logging
 from argparse import Namespace
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,6 +16,13 @@ from pyrit.cli import _config_reader as pyrit_scan_config_reader
 from pyrit.cli import pyrit_scan
 from pyrit.models import Parameter
 from unit.mocks import make_scenario_result
+
+# A valid UTF-8 initializer whose text is not pure ASCII. Decoded with a Windows ANSI code page
+# this either mangles the prompt (cp1252) or raises UnicodeDecodeError (cp932/936/949/950).
+UTF8_INITIALIZER_SOURCE = (
+    "from pyrit.setup.pyrit_initializer import PyRITInitializer\n"
+    'SYSTEM_PROMPT = "Réponds en français, café. 日本語でも回答してください。"\n'
+)
 
 
 def _sp(*, name, description="", default=None, param_type="str", choices=None, is_list=False) -> Parameter:
@@ -329,7 +337,7 @@ class TestExtractScenarioArgs:
 
 def _make_scenario_result():
     """Build a minimal but valid ``ScenarioResult`` for the run-results happy path."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from pyrit.models import (
         AttackOutcome,
@@ -344,7 +352,7 @@ def _make_scenario_result():
         outcome=AttackOutcome.SUCCESS,
         executed_turns=1,
         execution_time_ms=10,
-        timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        timestamp=datetime(2025, 1, 1, tzinfo=UTC),
     )
     return make_scenario_result(
         scenario_name="test_scenario",
@@ -360,7 +368,7 @@ def _make_scenario_result():
 
 def _mock_api_client():
     """Create a mock PyRITApiClient with default response behaviors (typed wire-data)."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from pyrit.models import ScenarioRunState, TargetCapabilities
     from pyrit.models.catalog import (
@@ -369,7 +377,7 @@ def _mock_api_client():
         TargetInstance,
     )
 
-    now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2025, 1, 1, tzinfo=UTC)
 
     client = AsyncMock()
     client.health_check_async.return_value = True
@@ -621,12 +629,12 @@ class TestMain:
     @patch("pyrit.cli.api_client.PyRITApiClient")
     def test_main_failed_scenario(self, mock_client_class, mock_probe):
         """Test main when scenario run fails."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from pyrit.models import ScenarioRunState
         from pyrit.models.catalog import ScenarioRunSummary
 
-        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 1, 1, tzinfo=UTC)
         mock_client = _mock_api_client()
         mock_client.get_scenario_run_async.return_value = ScenarioRunSummary(
             scenario_result_id="test-id",
@@ -1463,9 +1471,22 @@ class TestMainExtraPaths:
             result = await pyrit_scan._handle_add_initializer_async(client=client, parsed_args=parsed_args)
 
         assert result == 0
-        open_mock.assert_called_once_with(script.resolve())
+        open_mock.assert_called_once_with(script.resolve(), encoding="utf-8")
         async_file.read.assert_awaited_once()
         assert client.register_initializer_async.await_args.kwargs["script_content"] == "# stub initializer\n"
+
+    async def test_handle_add_initializer_reads_source_as_utf8(self, tmp_path):
+        """Initializer source is UTF-8 (PEP 3120), not the machine's locale encoding."""
+        script = tmp_path / "utf8_init.py"
+        script.write_bytes(UTF8_INITIALIZER_SOURCE.encode("utf-8"))
+        client = AsyncMock()
+
+        result = await pyrit_scan._handle_add_initializer_async(
+            client=client, parsed_args=Namespace(files=[str(script)])
+        )
+
+        assert result == 0
+        assert client.register_initializer_async.await_args.kwargs["script_content"] == UTF8_INITIALIZER_SOURCE
 
     @patch(
         "pyrit.cli._server_launcher.ServerLauncher.probe_health_async",
@@ -1513,6 +1534,52 @@ class TestScenarioResults:
         client.get_scenario_run_results_async.assert_awaited_once_with(scenario_result_id="SID")
         mock_print.assert_awaited_once()
 
+    def test_handle_results_json_output_writes_file(self, tmp_path):
+        import asyncio
+        import json
+
+        out = tmp_path / "out.json"
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "json", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        assert json.loads(out.read_text(encoding="utf-8"))["view"] == "overview"
+
+    def test_handle_results_pretty_output_file_errors(self, tmp_path, capsys):
+        import asyncio
+
+        out = tmp_path / "out.txt"
+        client = AsyncMock()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "pretty", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 1
+        assert "requires --format json" in capsys.readouterr().out
+        assert not out.exists()
+
+    def test_handle_results_html_output_writes_report(self, tmp_path):
+        import asyncio
+
+        out = tmp_path / "report.html"
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        client.get_conversation_messages_async.return_value = {"messages": []}
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "html", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        text = out.read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in text
+        assert "test_scenario" in text
+
+    def test_handle_results_html_without_output_errors(self, capsys):
+        import asyncio
+
+        client = AsyncMock()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "html"])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 1
+        assert "requires --output" in capsys.readouterr().out
+
     def test_handle_results_attacks_prints_table(self, capsys):
         import asyncio
 
@@ -1542,7 +1609,7 @@ class TestScenarioResults:
         assert "give me data" in out
         assert "Conversations" in out
 
-    def test_handle_results_full_prints_table_then_transcripts(self, capsys):
+    def test_handle_results_full_prints_overview_then_transcripts(self, capsys):
         import asyncio
 
         client = AsyncMock()
@@ -1552,8 +1619,24 @@ class TestScenarioResults:
         rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
         assert rc == 0
         out = capsys.readouterr().out
-        assert "Attack Results" in out
+        assert "SCENARIO RESULTS" in out
         assert "Conversations" in out
+        assert "▼ Attack Results" not in out
+
+    def test_handle_results_full_json_stdout_stays_single_document(self, capsys):
+        import asyncio
+        import json
+
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        client.get_conversation_messages_async.return_value = {"messages": []}
+        # No --output and no --limit: the heavy-view notice fires, but must not corrupt stdout json.
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--view", "full", "--format", "json"])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "at most 5" in captured.err  # advisory notice went to stderr
+        assert json.loads(captured.out)["view"] == "full"  # stdout is one valid json document
 
     def test_handle_results_conversations_reports_fetch_error(self, capsys):
         import asyncio
@@ -1597,7 +1680,7 @@ class TestScenarioParamFlow:
 
     @staticmethod
     def _build_mock_client(supported_params=None, status="COMPLETED"):
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         from pyrit.models import ScenarioRunState
@@ -1606,7 +1689,7 @@ class TestScenarioParamFlow:
             ScenarioRunSummary,
         )
 
-        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 1, 1, tzinfo=UTC)
         typed_params: list[Parameter] = []
         for p in supported_params or []:
             if isinstance(p, Parameter):
@@ -1763,13 +1846,13 @@ class TestPollStreamsRetryWarnings:
     """The poll loop should stream retry warnings as attack results land."""
 
     async def test_poll_prints_retry_warnings_once(self, capsys):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from pyrit.models import ScenarioRunState
         from pyrit.models.catalog import AttackRetrySummary, ScenarioRunSummary
         from pyrit.models.retry_event import RetryEvent
 
-        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 1, 1, tzinfo=UTC)
         retry = RetryEvent(
             attempt_number=3,
             exception_type="RateLimitError",

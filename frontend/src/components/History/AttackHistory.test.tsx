@@ -119,14 +119,14 @@ describe('AttackHistory', () => {
       expect(screen.getByTestId('empty-state')).toBeInTheDocument()
     })
     expect(screen.getByText('No attacks found')).toBeInTheDocument()
-    expect(screen.getByText('Configure a target before starting an attack.')).toBeInTheDocument()
+    expect(screen.getByText('Set an objective default in the registry, or select a target directly in Chat.')).toBeInTheDocument()
 
     const configureTargetButton = screen.getByRole('button', { name: 'Configure target' })
     expect(configureTargetButton).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Start attack' })).not.toBeInTheDocument()
 
     await user.click(configureTargetButton)
-    expect(onNavigate).toHaveBeenCalledWith('targets')
+    expect(onNavigate).toHaveBeenCalledWith('registry')
   })
 
   it('should guide users with an active target to start an attack', async () => {
@@ -687,9 +687,9 @@ describe('AttackHistory', () => {
     })
     mockedLabelsApi.getLabels.mockResolvedValue({
       source: 'attacks',
+      operators: ['alice', 'bob'],
+      operations: ['op_one'],
       labels: {
-        operator: ['alice', 'bob'],
-        operation: ['op_one'],
         custom_tag: ['val1', 'val2'],
       },
     })
@@ -705,6 +705,39 @@ describe('AttackHistory', () => {
     })
     expect(mockedAttacksApi.getConverterOptions).toHaveBeenCalled()
     expect(mockedLabelsApi.getLabels).toHaveBeenCalled()
+  })
+
+  it('should narrow arbitrary label options by selected attribution and labels', async () => {
+    mockedAttacksApi.listAttacks.mockResolvedValue({
+      items: [],
+      pagination: { limit: 25, has_more: false },
+    })
+    mockedLabelsApi.getLabels.mockResolvedValue({
+      source: 'attacks',
+      operators: ['alice', 'bob'],
+      operations: ['nightly'],
+      labels: { env: ['prod'] },
+    })
+    const activeFilters = {
+      ...DEFAULT_HISTORY_FILTERS,
+      operator: ['alice'],
+      operation: ['nightly'],
+      otherLabels: ['team:red'],
+    }
+
+    render(
+      <TestWrapper>
+        <AttackHistory {...defaultProps} filters={activeFilters} />
+      </TestWrapper>
+    )
+
+    await waitFor(() => {
+      expect(mockedLabelsApi.getLabels).toHaveBeenCalledWith('attacks', {
+        operator: ['alice'],
+        operation: ['nightly'],
+        label: ['team:red'],
+      })
+    })
   })
 
   it('should show empty text with filter hint when filters active and no results', async () => {

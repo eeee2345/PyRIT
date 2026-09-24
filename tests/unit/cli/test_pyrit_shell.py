@@ -6,6 +6,7 @@ Unit tests for the pyrit_shell CLI module (thin REST client).
 """
 
 import asyncio
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,13 @@ import pytest
 from pyrit.cli import pyrit_shell
 from pyrit.models import Parameter
 from unit.mocks import make_scenario_result
+
+# A valid UTF-8 initializer whose text is not pure ASCII. Decoded with a Windows ANSI code page
+# this either mangles the prompt (cp1252) or raises UnicodeDecodeError (cp932/936/949/950).
+UTF8_INITIALIZER_SOURCE = (
+    "from pyrit.setup.pyrit_initializer import PyRITInitializer\n"
+    'SYSTEM_PROMPT = "Réponds en français, café. 日本語でも回答してください。"\n'
+)
 
 
 def _sp(*, name, description="", default=None, param_type="str", choices=None, is_list=False) -> Parameter:
@@ -513,6 +521,29 @@ class TestDoAddInitializer:
         assert "Registered initializer 'my_init'" in capsys.readouterr().out
         client.register_initializer_async.assert_awaited_once()
 
+    def test_success_path_reads_source_as_utf8(self, shell, tmp_path, capsys):
+        """Initializer source is UTF-8 (PEP 3120), not the machine's locale encoding."""
+        s, client = shell
+        script = tmp_path / "utf8_init.py"
+        script.write_bytes(UTF8_INITIALIZER_SOURCE.encode("utf-8"))
+        client.register_initializer_async = AsyncMock(return_value={"status": "ok"})
+
+        s.do_add_initializer(str(script))
+
+        assert "Registered initializer 'utf8_init'" in capsys.readouterr().out
+        assert client.register_initializer_async.await_args.kwargs["script_content"] == UTF8_INITIALIZER_SOURCE
+
+    def test_reads_script_with_explicit_utf8_encoding(self, shell, tmp_path):
+        s, client = shell
+        script = tmp_path / "utf8_init.py"
+        script.write_bytes(UTF8_INITIALIZER_SOURCE.encode("utf-8"))
+        client.register_initializer_async = AsyncMock(return_value={"status": "ok"})
+
+        with patch.object(pyrit_shell.Path, "read_text", autospec=True, return_value="x = 1") as read_text_mock:
+            s.do_add_initializer(str(script))
+
+        assert read_text_mock.call_args.kwargs.get("encoding") == "utf-8"
+
     def test_success_with_quoted_path_containing_spaces(self, shell, tmp_path, capsys):
         s, client = shell
         script_dir = tmp_path / "initializer scripts"
@@ -575,12 +606,12 @@ class TestDoRun:
     @staticmethod
     def _run_payload(status="COMPLETED"):
         """Build a typed ScenarioRunSummary for use as a mock return value."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from pyrit.models import ScenarioRunState
         from pyrit.models.catalog import ScenarioRunSummary
 
-        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2025, 1, 1, tzinfo=UTC)
         return ScenarioRunSummary(
             scenario_result_id="rid-1",
             scenario_name="foo",
@@ -1067,14 +1098,15 @@ class TestDoScenarioResults:
         assert "do it" in out
         assert client.get_conversation_messages_async.await_count == 2
 
-    def test_full_view_prints_table_then_transcripts(self, shell, capsys):
+    def test_full_view_prints_overview_then_transcripts(self, shell, capsys):
         s, client = shell
         client.get_scenario_run_results_async = AsyncMock(return_value=_attacks_scenario_result())
         client.get_conversation_messages_async = AsyncMock(return_value={"messages": []})
         s.do_scenario_results("rid-1 --view full")
         out = capsys.readouterr().out
-        assert "Attack Results" in out
+        assert "SCENARIO RESULTS" in out
         assert "Conversations" in out
+        assert "▼ Attack Results" not in out
 
     def test_conversations_view_reports_fetch_error(self, shell, capsys):
         s, client = shell
@@ -1088,6 +1120,20 @@ class TestDoScenarioResults:
         client.get_scenario_run_results_async = AsyncMock(side_effect=RuntimeError("nope"))
         s.do_scenario_results("rid-1")
         assert "Error (RuntimeError): nope" in capsys.readouterr().out
+
+    def test_html_format_writes_full_report(self, shell, tmp_path):
+        s, client = shell
+        client.get_scenario_run_results_async = AsyncMock(return_value=_attacks_scenario_result())
+        client.get_conversation_messages_async = AsyncMock(return_value={"messages": []})
+        out_file = tmp_path / "report.html"
+        # shlex.split is posix, so pass a forward-slash path to avoid backslash escapes.
+        s.do_scenario_results(f"rid-1 --view full --format html --output {out_file.as_posix()}")
+        assert out_file.read_text(encoding="utf-8").lstrip().startswith("<!DOCTYPE html>")
+
+    def test_html_format_without_output_errors(self, shell, capsys):
+        s, _ = shell
+        s.do_scenario_results("rid-1 --format html")
+        assert "Error" in capsys.readouterr().out
 
     def test_print_scenario_alias_warns_and_delegates(self, shell, capsys):
         s, client = shell
